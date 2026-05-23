@@ -1070,6 +1070,12 @@ def _auth_headers_agent(token: str, ua: str, lang: str) -> dict:
 
 def agent_login(session: requests.Session, email: str, password: str,
                 ua: str, lang: str) -> Optional[dict]:
+    """
+    Return value:
+      dict   → login sukses
+      None   → gagal karena koneksi/proxy (boleh retry dengan proxy lain)
+      "UNVERIFIED" → 401 email belum verified (JANGAN retry/switch proxy — sia-sia)
+    """
     url = f"{HATCHER_BASE_API}/auth/login"
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "Origin": "https://hatcher.host", "Referer": "https://hatcher.host/login",
@@ -1083,7 +1089,12 @@ def agent_login(session: requests.Session, email: str, password: str,
             user  = data["data"]["user"]
             p_agent(f"Login OK: {cp(email, C.BCYAN)} (id={cp(str(user['id']), C.BWHITE)})")
             return {"token": token, "refreshToken": data["data"].get("refreshToken"), "user": user}
-        p_warn(f"Login agent gagal [{r.status_code}]: {data.get('error', r.text[:80])}")
+        err_msg = data.get("error", r.text[:80])
+        # 401 dengan pesan "verify" = email belum diverifikasi → bukan masalah proxy
+        if r.status_code == 401:
+            p_warn(f"Login agent gagal [{r.status_code}]: {err_msg}")
+            return "UNVERIFIED"
+        p_warn(f"Login agent gagal [{r.status_code}]: {err_msg}")
         return None
     except Exception as e:
         p_err(f"Login agent exception: {e}"); return None
@@ -1183,10 +1194,17 @@ def auto_create_agent_for_account(session: requests.Session, email: str, passwor
     delay.short()
     auth = None
     for _attempt in range(MAX_RETRIES):
-        auth = agent_login(session, email, password, ua, lang)
-        if auth:
+        login_result = agent_login(session, email, password, ua, lang)
+        if login_result == "UNVERIFIED":
+            # Email belum verified → bukan masalah proxy, langsung stop tanpa scan proxy
+            p_err("Login gagal: email belum terverifikasi, skip create agent (tidak scan proxy)")
+            result["agent_status"] = "login_failed"
+            return result
+        if login_result:
+            auth = login_result
             break
-        p_warn(f"Login gagal (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
+        # Gagal karena koneksi/proxy → boleh ganti proxy
+        p_warn(f"Login gagal koneksi (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
         if not _try_switch_proxy("Login"):
             break
         session = sm.session  # update referensi session setelah switch
@@ -1489,10 +1507,18 @@ def main():
         # ── Step 7: Auto Create Agent ────────────────────────────────
         p_step(7, 7, "Auto Create Agent")
         delay.short()
-        agent_result = auto_create_agent_for_account(
-            session=sm.session, email=temp_email, password=password,
-            username=username, proxy_str=account_proxy or "direct",
-            ua=account_ua, lang=account_lang, delay=delay, sm=sm)
+
+        if not verified:
+            p_warn("Akun belum terverifikasi — skip create agent (akan gagal login 401)")
+            agent_result = {"agent_status": "login_failed", "agent_id": None,
+                            "agent_name": None, "agent_slug": None,
+                            "agent_url": None, "agent_configured": False,
+                            "agent_proxy": account_proxy or "direct"}
+        else:
+            agent_result = auto_create_agent_for_account(
+                session=sm.session, email=temp_email, password=password,
+                username=username, proxy_str=account_proxy or "direct",
+                ua=account_ua, lang=account_lang, delay=delay, sm=sm)
 
         agent_entry = {"email": temp_email, "username": username,
                        "verified": verified, "proxy": account_proxy or "direct",
