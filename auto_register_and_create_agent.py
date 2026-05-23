@@ -125,11 +125,12 @@ RETRY_BACKOFF_BASE   = 5
 RATE_LIMIT_PAUSE     = 120
 
 USE_PROXY            = True
-PROXY_TEST_TIMEOUT   = 20
+PROXY_TEST_TIMEOUT   = 12   # diperkecil: proxy lambat langsung gugur (hemat waktu)
+# Test URL wajib HTTPS agar proxy yang tidak support SSL langsung gugur
 PROXY_TEST_URLS      = [
-    "http://httpbin.org/ip",
-    "https://api.ipify.org?format=json",
-    "http://ip-api.com/json",
+    "https://api.ipify.org?format=json",   # HTTPS — wajib lolos SSL
+    "https://httpbin.org/ip",              # HTTPS fallback
+    "http://ip-api.com/json",             # HTTP fallback terakhir
 ]
 PROXY_MAX_TEST       = 15
 
@@ -414,21 +415,56 @@ class ProxyManager:
             p_warn(f"Tidak ada proxy yang lulus test! Cek '{PROXY_FILE}'")
 
     def _do_test(self, proxy_url: str) -> bool:
+        """
+        Test proxy dengan request HTTPS ke api.hatcher.host terlebih dahulu.
+        Proxy yang tidak bisa handle SSL/HTTPS langsung gugur — tidak boleh lolos.
+        """
         proxy_dict = self.get_proxy_dict(proxy_url)
+
+        # ── Prioritas: test langsung ke target domain ─────────────────
+        # Ini paling relevan — kalau bisa konek ke hatcher, pasti bisa dipakai
+        try:
+            r = requests.get(
+                "https://api.hatcher.host/health",
+                proxies=proxy_dict,
+                timeout=PROXY_TEST_TIMEOUT,
+                headers={"User-Agent": random.choice(USER_AGENTS)},
+                verify=False  # kita disable SSL verify, tapi koneksi HTTPS harus tetap bisa
+            )
+            # Status apapun (200, 404, 405, dll) = proxy bisa reach target = LULUS
+            return True
+        except requests.exceptions.SSLError:
+            # Proxy tidak bisa handle HTTPS sama sekali → GUGUR
+            return False
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout):
+            pass  # Timeout ke hatcher, coba fallback
+        except requests.exceptions.ProxyError:
+            return False  # Proxy error fatal → GUGUR
+        except Exception:
+            pass  # Error lain, coba fallback
+
+        # ── Fallback: test ke IP-check HTTPS ─────────────────────────
         for test_url in PROXY_TEST_URLS:
             try:
-                r = requests.get(test_url, proxies=proxy_dict, timeout=PROXY_TEST_TIMEOUT,
-                                 headers={"User-Agent": random.choice(USER_AGENTS)}, verify=False)
+                r = requests.get(
+                    test_url,
+                    proxies=proxy_dict,
+                    timeout=PROXY_TEST_TIMEOUT,
+                    headers={"User-Agent": random.choice(USER_AGENTS)},
+                    verify=False
+                )
                 if r.status_code == 200:
                     return True
+            except requests.exceptions.SSLError:
+                # Proxy tidak bisa handle SSL → GUGUR langsung
+                return False
             except requests.exceptions.ConnectTimeout:
                 continue
             except requests.exceptions.ProxyError:
-                break
-            except requests.exceptions.SSLError:
-                return True
+                return False
             except Exception:
                 continue
+
         return False
 
     def _normalize(self, raw: str) -> Optional[str]:
@@ -600,6 +636,9 @@ class SessionManager:
         p_info(f"Lang : {cp(self.current_lang, C.DIM+C.WHITE)}")
 
         self.session = requests.Session()
+        # Disable SSL verification globally untuk session ini
+        # (diperlukan karena banyak proxy tidak support SSL chain dengan benar)
+        self.session.verify = False
         if proxy_override:
             self.current_proxy = proxy_override
         elif USE_PROXY:
@@ -633,6 +672,7 @@ class SessionManager:
         self.current_proxy = new_proxy
         self.session.close()
         self.session = requests.Session()
+        self.session.verify = False
         self.session.proxies.update(self.proxy_manager.get_proxy_dict(new_proxy))
         self.session.timeout = 20
         p_proxy(f"{cp('✓', C.BGREEN, True)} Switched ke proxy baru: {cp(new_proxy[:55], C.BBLUE, True)}")
@@ -641,13 +681,13 @@ class SessionManager:
         referer = kwargs.pop("referer", None)
         h = self.header_factory.build(self.current_ua, referer=referer, accept_language=self.current_lang)
         if "headers" in kwargs: h.update(kwargs.pop("headers"))
-        return self.session.get(url, headers=h, **kwargs)
+        return self.session.get(url, headers=h, verify=False, **kwargs)
 
     def post(self, url: str, **kwargs) -> requests.Response:
         referer = kwargs.pop("referer", None)
         h = self.header_factory.build(self.current_ua, referer=referer, accept_language=self.current_lang)
         if "headers" in kwargs: h.update(kwargs.pop("headers"))
-        return self.session.post(url, headers=h, **kwargs)
+        return self.session.post(url, headers=h, verify=False, **kwargs)
 
     def mark_proxy_failed(self):
         self.switch_proxy_on_failure()
@@ -680,7 +720,7 @@ class TempMailClient:
         url = f"{TEMPMAIL_BASE_URL}/generate/"
         for attempt in range(MAX_RETRIES):
             try:
-                r = self._session.get(url, headers=self._headers(), timeout=20)
+                r = self._session.get(url, headers=self._headers(), timeout=20, verify=False)
                 if r.status_code == 200:
                     data = r.json()
                     addr, tok = data.get("address", ""), data.get("token", "")
@@ -706,7 +746,7 @@ class TempMailClient:
     def fetch(self, token: str) -> Tuple[list, str]:
         url = f"{TEMPMAIL_BASE_URL}/auth/{token}"
         try:
-            r = self._session.get(url, headers=self._headers(), timeout=20)
+            r = self._session.get(url, headers=self._headers(), timeout=20, verify=False)
             if r.status_code == 200:
                 data      = r.json()
                 new_token = data.get("token", token)
@@ -839,11 +879,14 @@ class HatcherVerifier:
         headers = self._make_headers()
         try:
             if style == "body":
-                r = self.sm.session.post(endpoint, json={"token": token}, headers=headers, timeout=20, allow_redirects=True)
+                r = self.sm.session.post(endpoint, json={"token": token}, headers=headers,
+                                         timeout=20, allow_redirects=True, verify=False)
             elif style == "query":
-                r = self.sm.session.get(endpoint, params={"token": token}, headers=headers, timeout=20, allow_redirects=True)
+                r = self.sm.session.get(endpoint, params={"token": token}, headers=headers,
+                                        timeout=20, allow_redirects=True, verify=False)
             elif style == "path":
-                r = self.sm.session.get(endpoint.replace("{token}", token), headers=headers, timeout=20, allow_redirects=True)
+                r = self.sm.session.get(endpoint.replace("{token}", token), headers=headers,
+                                        timeout=20, allow_redirects=True, verify=False)
             else:
                 return False, "skip"
             return self._check_response(r, token)
@@ -1001,7 +1044,8 @@ def agent_login(session: requests.Session, email: str, password: str,
                "Origin": "https://hatcher.host", "Referer": "https://hatcher.host/login",
                "User-Agent": ua, "Accept-Language": lang}
     try:
-        r = session.post(url, headers=headers, json={"email": email, "password": password}, timeout=20)
+        r = session.post(url, headers=headers, json={"email": email, "password": password},
+                         timeout=20, verify=False)
         data = r.json() if r.content else {}
         if r.status_code == 200 and data.get("success"):
             token = data["data"]["token"]
@@ -1018,7 +1062,8 @@ def agent_create(session: requests.Session, token: str, username: str,
     url     = f"{HATCHER_BASE_API}/agents"
     payload = {"name": AGENT_NAME_TEMPLATE.format(username=username), "isPublic": AGENT_IS_PUBLIC}
     try:
-        r = session.post(url, headers=_auth_headers_agent(token, ua, lang), json=payload, timeout=20)
+        r = session.post(url, headers=_auth_headers_agent(token, ua, lang), json=payload,
+                         timeout=20, verify=False)
         data = r.json() if r.content else {}
         if r.status_code in (200, 201) and data.get("success"):
             agent = data["data"]
@@ -1027,7 +1072,8 @@ def agent_create(session: requests.Session, token: str, username: str,
         err = data.get("error", r.text)
         if r.status_code == 400 and "maximum" in err.lower() and "agent" in err.lower():
             p_warn("Limit agent free tier, ambil existing...")
-            r2 = session.get(url, headers=_auth_headers_agent(token, ua, lang), timeout=15)
+            r2 = session.get(url, headers=_auth_headers_agent(token, ua, lang),
+                             timeout=15, verify=False)
             d2 = r2.json() if r2.content else {}
             if d2.get("success") and d2.get("data"):
                 ex = d2["data"][0]
@@ -1043,7 +1089,8 @@ def agent_start(session: requests.Session, token: str, agent_id: str,
                 ua: str, lang: str) -> bool:
     url = f"{HATCHER_BASE_API}/agents/{agent_id}/start"
     try:
-        r = session.post(url, headers=_auth_headers_agent(token, ua, lang), json={}, timeout=30)
+        r = session.post(url, headers=_auth_headers_agent(token, ua, lang), json={},
+                         timeout=30, verify=False)
         data = r.json() if r.content else {}
         if r.status_code == 200 and data.get("success"):
             status = data["data"].get("status", "unknown")
@@ -1061,7 +1108,8 @@ def agent_configure(session: requests.Session, token: str, agent_id: str,
                "config": {"systemPrompt": AGENT_SYSTEM_PROMPT, "model": AGENT_MODEL},
                "isPublic": AGENT_IS_PUBLIC}
     try:
-        r = session.patch(url, headers=_auth_headers_agent(token, ua, lang), json=payload, timeout=20)
+        r = session.patch(url, headers=_auth_headers_agent(token, ua, lang), json=payload,
+                          timeout=20, verify=False)
         data = r.json() if r.content else {}
         if r.status_code == 200 and data.get("success"):
             p_agent(f"Agent configured: model={cp(AGENT_MODEL, C.BCYAN)}")
