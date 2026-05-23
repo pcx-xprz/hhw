@@ -20,6 +20,7 @@ import re
 import logging
 import os
 import sys
+import threading
 from datetime import datetime
 from typing import Optional, Tuple
 from bs4 import BeautifulSoup
@@ -367,12 +368,14 @@ class HeaderFactory:
 # ══════════════════════════════════════════════════════════════════════
 class ProxyManager:
     def __init__(self):
-        self.proxies = []
-        self.failed  = set()
-        self.used    = set()
-        self.working = []
+        self.proxies  = []
+        self.failed   = set()
+        self.used     = set()
+        self.working  = []
+        self._lock    = threading.Lock()          # thread-safe access
+        self._bg_done = False                     # flag background scanner selesai
         self._load()
-        self._initial_test()
+        # ── TIDAK ada pre-scan di sini — langsung pakai saat dibutuhkan ──
 
     def _load(self):
         if not os.path.exists(PROXY_FILE):
@@ -395,24 +398,36 @@ class ProxyManager:
         self.proxies = loaded
         p_proxy(f"Loaded {cp(str(len(self.proxies)), C.BWHITE, True)} proxy dari '{PROXY_FILE}'")
 
-    def _initial_test(self):
-        if not self.proxies:
-            return
-        MAX_TEST = min(PROXY_MAX_TEST, len(self.proxies))
-        p_proxy(f"Testing {cp(str(MAX_TEST), C.BYELLOW, True)} proxy awal...")
-        for i in range(MAX_TEST):
-            p = self.proxies[i]
-            short = p[:50]
-            if self._do_test(p):
-                self.working.append(p)
-                p_proxy(f"{cp('✓', C.BGREEN, True)} [{i+1}/{MAX_TEST}] {cp(short, C.DIM+C.WHITE)} → {cp('HIDUP', C.BGREEN, True)}")
-            else:
-                p_proxy(f"{cp('✗', C.BRED, True)} [{i+1}/{MAX_TEST}] {cp(short, C.DIM+C.WHITE)} → {cp('MATI', C.BRED)}")
-        if self.working:
-            p_ok(f"{len(self.working)} proxy aktif siap dipakai")
-            random.shuffle(self.working)
-        else:
-            p_warn(f"Tidak ada proxy yang lulus test! Cek '{PROXY_FILE}'")
+    def start_background_scanner(self, target_count: int = 10):
+        """
+        Mulai background thread yang terus scan proxy secara paralel.
+        Target: isi self.working sampai ≥ target_count tanpa blokir main thread.
+        """
+        def _scan():
+            scanned_idx = 0
+            while not self._bg_done:
+                with self._lock:
+                    candidates = [p for p in self.proxies
+                                  if p not in self.failed and p not in self.working]
+                if not candidates:
+                    time.sleep(2); continue
+                p = random.choice(candidates)
+                if self._do_test(p):
+                    with self._lock:
+                        if p not in self.working:
+                            self.working.append(p)
+                    p_proxy(f"{cp('[BG]', C.DIM+C.BBLUE)} {cp('✓', C.BGREEN)} {p[:45]} → {cp('HIDUP', C.BGREEN)}")
+                else:
+                    self.mark_failed(p)
+                # Tidur sebentar antar test supaya tidak spam
+                time.sleep(0.3)
+
+        t = threading.Thread(target=_scan, daemon=True, name="ProxyScanBG")
+        t.start()
+        p_proxy(f"{cp('[BG]', C.DIM+C.BBLUE)} Background proxy scanner dimulai...")
+
+    def stop_background_scanner(self):
+        self._bg_done = True
 
     def _do_test(self, proxy_url: str) -> bool:
         """
@@ -487,49 +502,65 @@ class ProxyManager:
     def mark_failed(self, p: str):
         if not p or p in self.failed:
             return
-        self.failed.add(p)
+        with self._lock:
+            self.failed.add(p)
+            if p in self.working: self.working.remove(p)
+            if p in self.proxies:  self.proxies.remove(p)
+            self.used.discard(p)
         with open(FAILED_PROXY_FILE, "a") as f:
             f.write(p + "\n")
         p_warn(f"Proxy mati → {cp(p[:50], C.DIM+C.WHITE)}")
-        if p in self.working: self.working.remove(p)
-        if p in self.proxies:  self.proxies.remove(p)
-        self.used.discard(p)
-        p_proxy(f"Sisa working: {cp(str(len(self.working)), C.BYELLOW)} | Total: {cp(str(len(self.proxies)), C.BWHITE)}")
+        with self._lock:
+            p_proxy(f"Sisa working: {cp(str(len(self.working)), C.BYELLOW)} | Total: {cp(str(len(self.proxies)), C.BWHITE)}")
 
 
 
     def get_fresh_proxy(self) -> Optional[str]:
-        """Ambil proxy BARU yang belum pernah dipakai akun manapun."""
-        available = [p for p in self.working if p not in self.used]
+        """
+        Ambil proxy BARU yang belum dipakai.
+        Scan-and-go: begitu dapat 1 proxy hidup, langsung return — tidak tunggu semua di-scan.
+        """
+        # ── Cek working list dulu (hasil background scanner) ─────────
+        with self._lock:
+            available = [p for p in self.working if p not in self.used]
         if available:
             proxy = random.choice(available)
-            self.used.add(proxy)
+            with self._lock:
+                self.used.add(proxy)
             p_proxy(f"Pakai fresh proxy: {cp(proxy[:50], C.BBLUE, True)}")
             return proxy
 
-        # working habis, test dari pool
-        untried = [p for p in self.proxies if p not in self.used and p not in self.failed]
+        # ── Scan-and-go: scan satu per satu, return begitu dapat ─────
+        with self._lock:
+            untried = [p for p in self.proxies if p not in self.used and p not in self.failed]
         if untried:
             random.shuffle(untried)
-            for p in untried[:min(20, len(untried))]:
-                p_proxy(f"Test fresh proxy: {cp(p[:50], C.DIM+C.WHITE)}")
+            p_proxy(f"Scan-and-go: cari proxy hidup dari {len(untried)} kandidat...")
+            for p in untried:
+                short = p[:50]
+                p_proxy(f"  Test: {cp(short, C.DIM+C.WHITE)}")
                 if self._do_test(p):
-                    if p not in self.working: self.working.append(p)
-                    self.used.add(p)
-                    p_proxy(f"{cp('✓', C.BGREEN, True)} Fresh proxy OK: {cp(p[:50], C.BBLUE, True)}")
+                    with self._lock:
+                        if p not in self.working:
+                            self.working.append(p)
+                        self.used.add(p)
+                    p_proxy(f"{cp('✓', C.BGREEN, True)} Proxy OK: {cp(p[:50], C.BBLUE, True)}")
                     return p
                 else:
                     self.mark_failed(p)
 
-        # paksa test ulang sisa pool
-        all_remaining = [p for p in self.proxies if p not in self.failed]
+        # ── Paksa re-test semua sisa (tidak ada yang fresh lagi) ──────
+        with self._lock:
+            all_remaining = [p for p in self.proxies if p not in self.failed]
         if all_remaining:
             p_warn("Semua proxy sudah terpakai, test ulang sisa pool...")
             random.shuffle(all_remaining)
             for p in all_remaining[:min(30, len(all_remaining))]:
                 if self._do_test(p):
-                    if p not in self.working: self.working.append(p)
-                    self.used.add(p)
+                    with self._lock:
+                        if p not in self.working:
+                            self.working.append(p)
+                        self.used.add(p)
                     p_proxy(f"{cp('✓', C.BGREEN, True)} Re-test OK: {cp(p[:50], C.BBLUE, True)}")
                     return p
                 else:
@@ -1121,7 +1152,12 @@ def agent_configure(session: requests.Session, token: str, agent_id: str,
 
 def auto_create_agent_for_account(session: requests.Session, email: str, password: str,
                                    username: str, proxy_str: str, ua: str, lang: str,
-                                   delay: HumanDelay) -> dict:
+                                   delay: HumanDelay, sm: "SessionManager" = None) -> dict:
+    """
+    Buat agent untuk akun yang sudah register+verified.
+    sm (SessionManager) opsional — jika diberikan, dipakai untuk switch proxy
+    secara otomatis jika proxy mati di tengah proses.
+    """
     result = {"agent_status": "pending", "agent_id": None, "agent_name": None,
               "agent_slug": None, "agent_url": None, "agent_configured": False,
               "agent_proxy": proxy_str}
@@ -1129,22 +1165,65 @@ def auto_create_agent_for_account(session: requests.Session, email: str, passwor
     p_agent(f"Mulai create agent untuk {cp(email, C.BCYAN)}")
     print(f"  {csep('─', 50, C.MAGENTA)}")
 
+    def _try_switch_proxy(step_name: str) -> bool:
+        """Coba ganti proxy jika sm tersedia. Return True jika berhasil dapat proxy baru."""
+        if sm is None:
+            p_err(f"[{step_name}] Proxy mati, tidak ada SessionManager untuk switch!")
+            return False
+        try:
+            sm.switch_proxy_on_failure()
+            p_proxy(f"[{step_name}] Proxy diganti, retry step...")
+            return True
+        except RuntimeError:
+            p_err(f"[{step_name}] Tidak ada proxy tersisa!")
+            return False
+
+    # ── Step 1/4: Login ──────────────────────────────────────────────
     p_agent("Step 1/4 Login...")
     delay.short()
-    auth = agent_login(session, email, password, ua, lang)
+    auth = None
+    for _attempt in range(MAX_RETRIES):
+        auth = agent_login(session, email, password, ua, lang)
+        if auth:
+            break
+        p_warn(f"Login gagal (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
+        if not _try_switch_proxy("Login"):
+            break
+        session = sm.session  # update referensi session setelah switch
+        delay.short()
+
     if not auth:
         result["agent_status"] = "login_failed"
-        p_err("Login gagal, skip create agent")
+        p_err("Login gagal setelah semua retry, skip create agent")
         return result
 
     token = auth["token"]
     delay.short()
 
+    # ── Step 2/4: Create agent ───────────────────────────────────────
     p_agent("Step 2/4 Create agent...")
-    agent = agent_create(session, token, username, ua, lang)
+    agent = None
+    for _attempt in range(MAX_RETRIES):
+        agent = agent_create(session, token, username, ua, lang)
+        if agent:
+            break
+        p_warn(f"Create agent gagal (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
+        if not _try_switch_proxy("CreateAgent"):
+            break
+        session = sm.session
+        # Re-login dengan proxy baru karena session berubah
+        p_agent("Re-login dengan proxy baru...")
+        delay.short()
+        auth = agent_login(session, email, password, ua, lang)
+        if not auth:
+            p_err("Re-login gagal setelah switch proxy!")
+            break
+        token = auth["token"]
+        delay.short()
+
     if not agent:
         result["agent_status"] = "create_failed"
-        p_err("Create agent gagal")
+        p_err("Create agent gagal setelah semua retry")
         return result
 
     result["agent_id"]     = agent["id"]
@@ -1154,22 +1233,54 @@ def auto_create_agent_for_account(session: requests.Session, email: str, passwor
     result["agent_reused"] = agent.get("_existing", False)
     delay.short()
 
+    # ── Step 3/4: Start/hatch agent ──────────────────────────────────
     p_agent("Step 3/4 Start/hatch agent...")
     if agent.get("status") == "active":
         p_agent(f"Agent sudah {cp('ACTIVE', C.BGREEN, True)}, skip start")
         started = True
     else:
-        started = agent_start(session, token, agent["id"], ua, lang)
+        started = False
+        for _attempt in range(MAX_RETRIES):
+            started = agent_start(session, token, agent["id"], ua, lang)
+            if started:
+                break
+            p_warn(f"Start agent gagal (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
+            if not _try_switch_proxy("StartAgent"):
+                break
+            session = sm.session
+            auth = agent_login(session, email, password, ua, lang)
+            if not auth:
+                p_err("Re-login gagal saat retry start agent!")
+                break
+            token = auth["token"]
+            delay.short()
+
     if not started:
         result["agent_status"] = "start_failed"
-        p_err("Start agent gagal")
+        p_err("Start agent gagal setelah semua retry")
         return result
 
     p_wait("Tunggu container siap 5s...")
     time.sleep(5)
 
+    # ── Step 4/4: Configure agent ────────────────────────────────────
     p_agent("Step 4/4 Configure agent...")
-    configured = agent_configure(session, token, agent["id"], username, ua, lang)
+    configured = False
+    for _attempt in range(MAX_RETRIES):
+        configured = agent_configure(session, token, agent["id"], username, ua, lang)
+        if configured:
+            break
+        p_warn(f"Configure agent gagal (attempt {_attempt+1}/{MAX_RETRIES}), coba ganti proxy...")
+        if not _try_switch_proxy("ConfigureAgent"):
+            break
+        session = sm.session
+        auth = agent_login(session, email, password, ua, lang)
+        if not auth:
+            p_err("Re-login gagal saat retry configure!")
+            break
+        token = auth["token"]
+        delay.short()
+
     result["agent_status"]     = "active"
     result["agent_configured"] = configured
 
@@ -1243,10 +1354,16 @@ def main():
         p_err(f"Tidak ada proxy! Buat '{PROXY_FILE}' dengan daftar proxy.")
         return
 
+    # ── Mulai background scanner SEBELUM init session ───────────────
+    # Background scanner langsung scan proxy secara paralel,
+    # sementara main thread langsung mulai scan-and-go untuk akun pertama.
+    pm.start_background_scanner(target_count=10)
+
     try:
         sm = SessionManager(pm)
     except RuntimeError as e:
         p_err(str(e))
+        pm.stop_background_scanner()
         return
 
     delay    = HumanDelay()
@@ -1257,14 +1374,29 @@ def main():
     results       = existing_results
     agent_results = existing_agents
 
-    ok_count   = 0
-    ver_count  = 0
-    agent_ok   = 0
-    fail_count = 0
+    ok_count      = 0
+    ver_count     = 0
+    agent_ok      = 0
+    fail_count    = 0
+    # idx = nomor tampilan akun (increment hanya jika agent berhasil dibuat)
+    # attempt = total percobaan (termasuk yang gagal, untuk batas infinite loop)
+    idx     = 0   # akun sukses + agent aktif
+    attempt = 0   # total iterasi (termasuk gagal)
+    MAX_ATTEMPTS = accounts_this_session * 5  # batas aman: maks 5x retry per target
 
     print()
-    for idx in range(1, accounts_this_session + 1):
-        p_account_header(idx, accounts_this_session)
+    # ── WHILE LOOP: lanjut sampai target terpenuhi ───────────────────
+    # Akun yang gagal register/agent TIDAK dihitung sebagai progress —
+    # loop terus jalan sampai benar-benar dapat `accounts_this_session`
+    # akun dengan agent aktif.
+    while idx < accounts_this_session:
+        attempt += 1
+        if attempt > MAX_ATTEMPTS:
+            p_err(f"Batas maksimum percobaan ({MAX_ATTEMPTS}x) tercapai, berhenti.")
+            break
+
+        display_idx = idx + 1  # nomor akun untuk tampilan
+        p_account_header(display_idx, accounts_this_session)
 
         # Rotate — proxy baru per akun
         try:
@@ -1280,7 +1412,10 @@ def main():
         p_step(1, 7, "Generate temporary email")
         result = tempmail.generate()
         if not result:
-            p_err("Gagal generate temp email, skip!"); fail_count += 1; delay.short(); continue
+            p_err("Gagal generate temp email, skip akun ini (tidak dihitung)!")
+            fail_count += 1
+            delay.short()
+            continue  # TIDAK increment idx — coba lagi
         temp_email, inbox_token = result
 
         # ── Step 2: Credentials ──────────────────────────────────────
@@ -1304,7 +1439,7 @@ def main():
         reg = register(sm, temp_email, username, password, delay)
 
         if reg["status"] != "success":
-            p_err(f"Register gagal: {cp(reg['status'], C.BRED, True)}")
+            p_err(f"Register gagal: {cp(reg['status'], C.BRED, True)} — akun ini TIDAK dihitung, coba lagi")
             fail_count += 1
             results.append({
                 "email": temp_email, "username": username, "password": password,
@@ -1313,7 +1448,8 @@ def main():
                 "timestamp": datetime.now().isoformat()
             })
             save_results(results)
-            delay.between_accounts(); continue
+            delay.between_accounts()
+            continue  # TIDAK increment idx
 
         ok_count += 1
 
@@ -1356,7 +1492,7 @@ def main():
         agent_result = auto_create_agent_for_account(
             session=sm.session, email=temp_email, password=password,
             username=username, proxy_str=account_proxy or "direct",
-            ua=account_ua, lang=account_lang, delay=delay)
+            ua=account_ua, lang=account_lang, delay=delay, sm=sm)
 
         agent_entry = {"email": temp_email, "username": username,
                        "verified": verified, "proxy": account_proxy or "direct",
@@ -1366,18 +1502,28 @@ def main():
 
         if agent_result["agent_status"] == "active":
             agent_ok += 1
+            idx += 1  # ✅ HANYA increment jika agent benar-benar aktif
+            p_ok(f"Progress: {cp(str(idx)+'/'+str(accounts_this_session), C.BGREEN, True)} akun dengan agent aktif")
         else:
-            p_warn(f"Agent gagal: {agent_result['agent_status']}")
+            p_warn(f"Agent gagal ({agent_result['agent_status']}) — akun ini TIDAK dihitung sebagai progress!")
+            p_warn(f"Progress tetap: {cp(str(idx)+'/'+str(accounts_this_session), C.BYELLOW)} — akan coba akun baru")
+            fail_count += 1
 
         # ── Mini summary tiap akun ───────────────────────────────────
+        agent_success = agent_result["agent_status"] == "active"
         print(f"\n  {csep('─', 55, C.CYAN)}")
-        print(f"  {cp('▶ SUMMARY AKUN #' + str(idx), C.BWHITE, True)}")
+        label_color = C.BGREEN if agent_success else C.BRED
+        print(f"  {cp('▶ SUMMARY AKUN #' + str(display_idx) + (' ✓' if agent_success else ' ✗ GAGAL'), label_color, True)}")
         print(f"  {cp('Email   :', C.DIM+C.WHITE)} {cp(temp_email, C.BCYAN)}")
         print(f"  {cp('User    :', C.DIM+C.WHITE)} {cp(username, C.BWHITE)}")
         print(f"  {cp('Pass    :', C.DIM+C.WHITE)} {cp(password, C.BWHITE)}")
         print(f"  {cp('Verified:', C.DIM+C.WHITE)} {cp('YES ✓', C.BGREEN, True) if verified else cp('NO ✗', C.BRED)}")
-        print(f"  {cp('Agent   :', C.DIM+C.WHITE)} {cp(agent_result.get('agent_url', '-'), C.BCYAN)}")
+        print(f"  {cp('Agent   :', C.DIM+C.WHITE)} {cp(agent_result.get('agent_url', '-'), C.BCYAN if agent_success else C.BRED)}")
         print(f"  {cp('Proxy   :', C.DIM+C.WHITE)} {cp((account_proxy or 'direct')[:55], C.BBLUE)}")
+        if agent_success:
+            print(f"  {cp('Status  :', C.DIM+C.WHITE)} {cp('DIHITUNG (' + str(idx) + '/' + str(accounts_this_session) + ')', C.BGREEN, True)}")
+        else:
+            print(f"  {cp('Status  :', C.DIM+C.WHITE)} {cp('TIDAK DIHITUNG — akan retry akun baru', C.BRED, True)}")
         print(f"  {csep('─', 55, C.CYAN)}")
 
         if idx < accounts_this_session:
@@ -1386,6 +1532,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     #  FINAL SUMMARY
     # ══════════════════════════════════════════════════════════════════
+    pm.stop_background_scanner()
     print(f"\n{csep('═', 65, C.BCYAN)}")
     print(f"  {cp('SELESAI — RINGKASAN SESI', C.BWHITE, True)}")
     print(csep("─", 65, C.BLUE))
@@ -1393,8 +1540,9 @@ def main():
     print(f"  {cp('Sesi ini target  :', C.DIM+C.WHITE)} {cp(str(accounts_this_session), C.BWHITE, True)}")
     print(f"  {cp('Register sukses  :', C.DIM+C.WHITE)} {cp(str(ok_count), C.BGREEN, True)}")
     print(f"  {cp('Akun terverified :', C.DIM+C.WHITE)} {cp(str(ver_count), C.BGREEN, True)}")
-    print(f"  {cp('Agent berhasil   :', C.DIM+C.WHITE)} {cp(str(agent_ok), C.BGREEN, True)}")
-    print(f"  {cp('Gagal            :', C.DIM+C.WHITE)} {cp(str(fail_count), C.BRED, True)}")
+    print(f"  {cp('Agent berhasil   :', C.DIM+C.WHITE)} {cp(str(idx), C.BGREEN, True)}  {cp('← ini yg dihitung (dapat referral)', C.BGREEN)}")
+    print(f"  {cp('Gagal/retry      :', C.DIM+C.WHITE)} {cp(str(fail_count), C.BRED, True)}")
+    print(f"  {cp('Total percobaan  :', C.DIM+C.WHITE)} {cp(str(attempt), C.BYELLOW)}")
     print(f"  {cp('Proxy terpakai   :', C.DIM+C.WHITE)} {cp(str(len(pm.used)), C.BBLUE)}")
     print(csep("─", 65, C.BLUE))
     print(f"  {cp('Total di file output :', C.DIM+C.WHITE)} {cp(str(total_in_file) + ' akun', C.BYELLOW, True)} ({cp('accumulated', C.BGREEN)})")
@@ -1404,7 +1552,7 @@ def main():
     print(csep("═", 65, C.BCYAN))
 
     # Tabel akun verified sesi ini
-    session_verified = [r for r in results[-accounts_this_session:] if r.get("verified")]
+    session_verified = [r for r in results[-attempt:] if r.get("verified")]
     if session_verified:
         print(f"\n  {cp('✓ Akun Terverifikasi (sesi ini):', C.BGREEN, True)}")
         print(f"  {cp('─'*63, C.DIM+C.WHITE)}")
@@ -1416,12 +1564,11 @@ def main():
         print(f"  {cp('─'*63, C.DIM+C.WHITE)}")
 
     # Tabel agent aktif sesi ini
-    session_agents = [r for r in agent_results[-accounts_this_session:] if r.get("agent_status") == "active"]
+    session_agents = [r for r in agent_results[-attempt:] if r.get("agent_status") == "active"]
     if session_agents:
         print(f"\n  {cp('✓ Agent Aktif (sesi ini):', C.BGREEN, True)}")
         print(f"  {cp('─'*63, C.DIM+C.WHITE)}")
         for r in session_agents:
-            proxy = (r.get("proxy") or "direct")[:22]
             print(f"  {cp(r['email'], C.BCYAN):<40} {cp(r.get('agent_url', '-'), C.BMAGENTA)}")
         print(f"  {cp('─'*63, C.DIM+C.WHITE)}")
 
