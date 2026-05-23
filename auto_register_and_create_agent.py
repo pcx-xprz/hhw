@@ -1000,7 +1000,12 @@ def check_avail(sm: SessionManager, field: str, val: str, delay: HumanDelay) -> 
             sm.mark_proxy_failed()
             if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BACKOFF_BASE)
         except requests.exceptions.ConnectTimeout:
+            sm.mark_proxy_failed()
             if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BACKOFF_BASE * (2**attempt))
+        except (requests.exceptions.ConnectionError, OSError):
+            # [WinError 10061] / RemoteDisconnected → proxy dead, ganti langsung
+            sm.mark_proxy_failed()
+            if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BACKOFF_BASE)
         except Exception as e:
             p_err(f"check {field}: {e}"); return False
     return False
@@ -1274,6 +1279,14 @@ def auto_create_agent_for_account(session: requests.Session, email: str, passwor
             delay.short()
 
     if not started:
+        # Agent sudah dibuat (ada URL) tapi start gagal karena koneksi/timeout
+        # Hatcher biasanya auto-start saat pertama kali diakses, jadi tetap hitung active
+        if result.get("agent_url"):
+            p_warn(f"Start agent gagal tapi agent sudah terbuat → tetap dihitung active")
+            p_warn(f"Agent URL: {cp(result['agent_url'], C.BCYAN)}")
+            result["agent_status"]     = "active"
+            result["agent_configured"] = False
+            return result
         result["agent_status"] = "start_failed"
         p_err("Start agent gagal setelah semua retry")
         return result
